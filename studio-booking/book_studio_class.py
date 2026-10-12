@@ -744,6 +744,7 @@ class Booker:
         log(f"polling {cfg.instructor} (id {cfg.instructor_id}) for classes {start} .. {end}")
         attempt = 0
         tried: set[int] = set()
+        seen_states: set[tuple] = set()
         last_msg = None
         while dt.datetime.now(ET) < end_time:
             attempt += 1
@@ -767,6 +768,10 @@ class Booker:
             # prefer open classes, earliest first
             candidates.sort(key=lambda e: (bool(e.get("is_full")), e["starts_at"]))
             for ev in candidates:
+                state = (int(ev["id"]), bool(ev.get("is_full")), ev.get("occupancy"), ev.get("waiting_count"))
+                if state in seen_states and ev.get("is_full") and not cfg.waitlist:
+                    continue  # still full, nothing new to do; stay quiet until the counts change
+                seen_states.add(state)
                 log(f"attempt {attempt}: trying {describe(ev)}")
                 result = self.book_event(api, ev, page)
                 if result == "rejected":
