@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """
-Peloton Studios class booker.
+Peloton Studios class booker (studio.onepeloton.com, Peloton Studios New York).
 
-Books an in-person class at studio.onepeloton.com (Peloton Studios NY / London)
-the moment the weekly release opens (Thursdays 12:00 PM ET).
+How the site works (reverse-engineered Oct 2026)
+------------------------------------------------
+* studio.onepeloton.com is a Next.js shell. Login is Auth0 (auth.onepeloton.com, Peloton account).
+* The schedule and booking UI is a TeamUp iframe served from schedule.studio.onepeloton.com
+  (TeamUp provider/business id 7248695). The frame talks to a REST API at
+  https://schedule.studio.onepeloton.com/api/v2/ with headers
+      Teamup-Provider-ID: 7248695, Teamup-Request-Mode: customer, Authorization: Token <session token>
+* New classes appear in GET /api/v2/events when Peloton publishes them (Thursdays 12:00 PM ET,
+  for the Thu-Mon that starts 35 days later). Booking a class is:
+      POST /api/v2/events/{id}/initiate_purchase  {customer, return_to, select_drop_in: true}  -> next_url (checkout)
+      POST /api/v2/events/{id}/register           {customer, customer_membership}             (membership/credit)
+      POST /api/v2/events/{id}/join_waitlist      {customer}
+* Instructor ids: Becs Gentry = 127606 (GET /api/v2/instructors?sort=name).
 
 Strategy
 --------
-1. Wake up a few minutes before the release (``--prestart-minutes``), log in with
-   the Peloton account, open the schedule and locate the target class card so
-   that everything is warm.
-2. Sync the local clock against the site's HTTP ``Date`` header.
-3. At T-0 start polling: reload, find the card for the instructor, click Book,
-   complete checkout (payment method on file), and verify the confirmation.
-4. Optionally fall back to the waitlist when the class is full.
+1. At T-prestart open the site in Chromium, log in (or reuse the saved browser profile), and
+   capture the TeamUp session token + customer id from the frame's own API traffic.
+2. From T-0 poll GET /events for the target instructor in the release window with plain HTTP
+   (no browser in the loop). The moment a matching, non-full class appears, fire the booking
+   call. Then let the browser finish the checkout page (payment method on file).
+3. Fall back to the waitlist when the class is full (--waitlist), and to clicking inside the
+   TeamUp frame if the API path is rejected.
 
-``--discover`` records every network request and every link/button on the page
-so you can find deeplinks and the underlying booking API (Peloton Studios runs
-on TeamUp). Feed what you find back via ``--schedule-url`` / ``--selectors``.
-
-Credentials come from the same env vars the peloton-to-garmin workflow uses:
-``P2G_PELOTON__EMAIL`` / ``P2G_PELOTON__PASSWORD`` (or ``STUDIO_EMAIL`` /
-``STUDIO_PASSWORD``).
+Credentials: P2G_PELOTON__EMAIL / P2G_PELOTON__PASSWORD (same names as the sync workflow secrets)
+or STUDIO_EMAIL / STUDIO_PASSWORD. With --profile-dir you can instead log in by hand once
+(--login-only --headful) and the session is reused on later runs.
 """
 from __future__ import annotations
 
@@ -31,19 +38,22 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
+
+import requests
 
 try:
     from playwright.sync_api import (
-        Browser,
         BrowserContext,
         Error as PlaywrightError,
-        Locator,
+        Frame,
         Page,
         TimeoutError as PlaywrightTimeout,
         sync_playwright,
@@ -55,46 +65,24 @@ except ImportError:  # pragma: no cover
 ET = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
 
+SITE_URL = "https://studio.onepeloton.com/new-york/schedule"
+TEAMUP_HOST = "https://schedule.studio.onepeloton.com"
+API = f"{TEAMUP_HOST}/api/v2"
+PROVIDER_ID = "7248695"
+PROVIDER_SLUG = "7248695-peloton-studios-new-york"
+FRAME_BASE = f"{TEAMUP_HOST}/w{PROVIDER_ID}/p/{PROVIDER_SLUG}/c/schedule"
+BECS_GENTRY_ID = 127606
+
 EXIT_BOOKED = 0
 EXIT_ERROR = 1
 EXIT_NOT_BOOKED = 2
 EXIT_NO_RELEASE_SOON = 3
 
-# Each entry is a list of candidate selectors tried in order. Override any key
-# with --selectors selectors.json once you have inspected the real page.
-DEFAULT_SELECTORS: dict[str, list[str]] = {
-    "cookie_accept": ["button:has-text('Accept')", "button:has-text('Agree')", "button:has-text('Got it')"],
-    "login_trigger": [
-        "a:has-text('Log in')", "button:has-text('Log in')", "a:has-text('Log In')", "button:has-text('Log In')",
-        "a:has-text('Sign in')", "button:has-text('Sign in')", "a:has-text('Sign In')", "button:has-text('Sign In')",
-        "a[href*='login']", "a[href*='signin']",
-    ],
-    "email": ["input[type='email']", "input[name='email']", "input[name='username']", "input[name='usernameOrEmail']", "#username", "#email"],
-    "password": ["input[type='password']", "input[name='password']", "#password"],
-    "login_submit": ["button[type='submit']", "button:has-text('Log in')", "button:has-text('Log In')", "button:has-text('Sign in')", "button:has-text('Continue')"],
-    "logged_in_marker": [
-        "text=/^\\s*(log ?out|sign ?out)\\s*$/i", "a[href*='logout']", "a[href*='signout']",
-        "text=/my (bookings|classes|account|schedule)/i", "[aria-label*='account' i]", "[data-testid*='account' i]",
-    ],
-    "schedule_link": ["a:has-text('Schedule')", "a:has-text('Book a class')", "a:has-text('Book a Class')", "a:has-text('Classes')", "a[href*='schedule']", "a[href*='classes']"],
-    "day_view": ["button:has-text('Day')", "a:has-text('Day')", "[role='tab']:has-text('Day')"],
-    "book_button": [
-        "button:has-text('Book')", "a:has-text('Book')", "button:has-text('Reserve')", "a:has-text('Reserve')",
-        "button:has-text('Register')", "a:has-text('Register')", "button:has-text('Sign up')", "button:has-text('Sign Up')",
-    ],
-    "waitlist_button": ["button:has-text('Waitlist')", "a:has-text('Waitlist')", "button:has-text('Join waitlist')", "button:has-text('Join Waitlist')"],
-    "confirm_button": [
-        "button:has-text('Confirm')", "button:has-text('Complete')", "button:has-text('Pay')", "button:has-text('Book now')",
-        "button:has-text('Book Now')", "button:has-text('Place order')", "button:has-text('Checkout')", "button:has-text('Check out')",
-        "button:has-text('Agree')", "button:has-text('Accept')", "button:has-text('Continue')",
-    ],
-    "success_marker": ["text=/confirmed|you.?re (all )?(booked|set)|booking (is )?complete|see you (in|at)|thank you for (your )?(booking|purchase)|added to (the )?wait ?list|you.?re on the wait ?list/i"],
-    "full_marker": ["text=/sold out|class (is )?full|fully booked|no (spots|spaces) (left|available)|wait ?list only/i"],
-    "error_marker": ["text=/something went wrong|try again|limit reached|maximum|too many requests|rate limit/i"],
-}
-
-BOOK_WORDS = re.compile(r"\b(book|reserve|register|sign\s?up)\b", re.I)
-WAITLIST_WORDS = re.compile(r"wait\s?list", re.I)
+EVENT_FIELDS = ",".join([
+    "id", "name", "starts_at", "ends_at", "is_full", "occupancy", "max_occupancy", "attending_count",
+    "waiting_count", "registrations_open_at", "active_registration_status", "customer_url",
+    "instructors", "offering_type.category.name", "offering_type.dropin_price", "venue.name",
+])
 
 
 # ----------------------------------------------------------------------------
@@ -105,88 +93,92 @@ class Config:
     email: str
     password: str
     instructor: str
-    discipline: Optional[str]
+    instructor_id: Optional[int]
+    class_name: Optional[str]
     class_time: Optional[str]
     class_day: Optional[str]
-    site_url: str
-    schedule_url: Optional[str]
-    release_weekday: int  # Monday=0 .. Sunday=6
+    window_start: Optional[dt.date]
+    window_end: Optional[dt.date]
+    release_weekday: int
     release_time: dt.time
+    release_offset_days: int
     prestart_minutes: float
     max_wait_minutes: float
     poll_seconds: float
     poll_interval: float
     waitlist: bool
+    membership: bool
     dry_run: bool
     discover: bool
     now: bool
+    login_only: bool
     headful: bool
-    slow_mo: int
+    profile_dir: Optional[Path]
     storage_state: Path
     out_dir: Path
-    selectors: dict[str, list[str]] = field(default_factory=lambda: dict(DEFAULT_SELECTORS))
     notify_url: Optional[str] = None
     chromium_path: Optional[str] = None
 
 
 def parse_args(argv: Optional[list[str]] = None) -> Config:
+    env = os.environ.get
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--instructor", default=os.environ.get("STUDIO_INSTRUCTOR", "Becs Gentry"))
-    p.add_argument("--discipline", default=os.environ.get("STUDIO_DISCIPLINE") or None,
-                   help="Optional text that must appear on the card, e.g. 'Tread' or 'Run'")
-    p.add_argument("--class-time", default=os.environ.get("STUDIO_CLASS_TIME") or None,
-                   help="Optional time text that must appear on the card, e.g. '7:00 AM'")
-    p.add_argument("--class-day", default=os.environ.get("STUDIO_CLASS_DAY") or None,
-                   help="Optional day text that must appear on/near the card, e.g. 'Sat' or 'Saturday'")
-    p.add_argument("--site-url", default=os.environ.get("STUDIO_SITE_URL", "https://studio.onepeloton.com/"))
-    p.add_argument("--schedule-url", default=os.environ.get("STUDIO_SCHEDULE_URL") or None,
-                   help="Deeplink to the schedule page/week to open after login (found via --discover)")
-    p.add_argument("--release-weekday", default=os.environ.get("STUDIO_RELEASE_WEEKDAY", "thu"))
-    p.add_argument("--release-time", default=os.environ.get("STUDIO_RELEASE_TIME", "12:00"), help="HH:MM, Eastern time")
-    p.add_argument("--prestart-minutes", type=float, default=float(os.environ.get("STUDIO_PRESTART_MINUTES", "5")))
-    p.add_argument("--max-wait-minutes", type=float, default=float(os.environ.get("STUDIO_MAX_WAIT_MINUTES", "60")),
-                   help="Exit immediately if the next release is further away than this (lets a cron fire at both DST offsets)")
-    p.add_argument("--poll-seconds", type=float, default=float(os.environ.get("STUDIO_POLL_SECONDS", "240")),
-                   help="How long to keep trying after the release time")
-    p.add_argument("--poll-interval", type=float, default=float(os.environ.get("STUDIO_POLL_INTERVAL", "0.75")))
-    p.add_argument("--waitlist", action="store_true", default=os.environ.get("STUDIO_WAITLIST", "false").lower() == "true",
-                   help="Join the waitlist if the class is already full")
-    p.add_argument("--dry-run", action="store_true", help="Do everything except the final confirm/pay click")
-    p.add_argument("--discover", action="store_true", help="Record network requests, links and buttons to the out dir")
-    p.add_argument("--now", action="store_true", help="Don't wait for the release time, run immediately")
-    p.add_argument("--headful", action="store_true", help="Show the browser window")
-    p.add_argument("--slow-mo", type=int, default=0, help="Playwright slow_mo in ms (debugging)")
-    p.add_argument("--storage-state", default=os.environ.get("STUDIO_STORAGE_STATE", str(HERE / "state" / "auth.json")))
-    p.add_argument("--out-dir", default=os.environ.get("STUDIO_OUT_DIR", str(HERE / "out")))
-    p.add_argument("--selectors", default=os.environ.get("STUDIO_SELECTORS") or None, help="JSON file overriding DEFAULT_SELECTORS keys")
+    p.add_argument("--instructor", default=env("STUDIO_INSTRUCTOR", "Becs Gentry"))
+    p.add_argument("--instructor-id", type=int, default=int(env("STUDIO_INSTRUCTOR_ID", "0")) or None,
+                   help="TeamUp instructor id (looked up by name when omitted; Becs Gentry = 127606)")
+    p.add_argument("--class-name", default=env("STUDIO_CLASS_NAME") or None,
+                   help="Optional text that must appear in the class name, e.g. 'Run' or '30 min'")
+    p.add_argument("--class-time", default=env("STUDIO_CLASS_TIME") or None, help="Optional start time, e.g. '7:30 AM'")
+    p.add_argument("--class-day", default=env("STUDIO_CLASS_DAY") or None, help="Optional weekday, e.g. 'Sat'")
+    p.add_argument("--window-start", default=env("STUDIO_WINDOW_START") or None,
+                   help="First class date to consider (YYYY-MM-DD). Default: release day + --release-offset-days")
+    p.add_argument("--window-end", default=env("STUDIO_WINDOW_END") or None,
+                   help="Last class date to consider (YYYY-MM-DD). Default: window start + 4 days (Thu-Mon)")
+    p.add_argument("--release-weekday", default=env("STUDIO_RELEASE_WEEKDAY", "thu"))
+    p.add_argument("--release-time", default=env("STUDIO_RELEASE_TIME", "12:00"), help="HH:MM Eastern")
+    p.add_argument("--release-offset-days", type=int, default=int(env("STUDIO_RELEASE_OFFSET_DAYS", "35")),
+                   help="Days between the release and the first class it unlocks (Peloton: 35)")
+    p.add_argument("--prestart-minutes", type=float, default=float(env("STUDIO_PRESTART_MINUTES", "5")))
+    p.add_argument("--max-wait-minutes", type=float, default=float(env("STUDIO_MAX_WAIT_MINUTES", "60")),
+                   help="Exit immediately if the next release is further away (lets a cron fire at both DST offsets)")
+    p.add_argument("--poll-seconds", type=float, default=float(env("STUDIO_POLL_SECONDS", "300")),
+                   help="How long to keep polling after the release time")
+    p.add_argument("--poll-interval", type=float, default=float(env("STUDIO_POLL_INTERVAL", "0.4")))
+    p.add_argument("--waitlist", action="store_true", default=env("STUDIO_WAITLIST", "false").lower() == "true")
+    p.add_argument("--membership", action="store_true", default=env("STUDIO_MEMBERSHIP", "false").lower() == "true",
+                   help="Book with a class credit/membership on the account instead of a $35 drop-in purchase")
+    p.add_argument("--dry-run", action="store_true", help="Find the class and stop before the booking/purchase call")
+    p.add_argument("--discover", action="store_true", help="Log every TeamUp API request (token redacted) and page state")
+    p.add_argument("--now", action="store_true", help="Skip waiting for the release; poll immediately")
+    p.add_argument("--login-only", action="store_true", help="Log in, save the session, exit (use with --headful)")
+    p.add_argument("--headful", action="store_true")
+    p.add_argument("--profile-dir", default=env("STUDIO_PROFILE_DIR") or None,
+                   help="Persistent Chromium profile dir; survives logins done by hand (recommended)")
+    p.add_argument("--storage-state", default=env("STUDIO_STORAGE_STATE", str(HERE / "state" / "auth.json")))
+    p.add_argument("--out-dir", default=env("STUDIO_OUT_DIR", str(HERE / "out")))
     a = p.parse_args(argv)
 
-    email = os.environ.get("P2G_PELOTON__EMAIL") or os.environ.get("STUDIO_EMAIL") or ""
-    password = os.environ.get("P2G_PELOTON__PASSWORD") or os.environ.get("STUDIO_PASSWORD") or ""
-
-    selectors = dict(DEFAULT_SELECTORS)
-    if a.selectors:
-        with open(a.selectors, encoding="utf-8") as fh:
-            overrides = json.load(fh)
-        for k, v in overrides.items():
-            selectors[k] = [v] if isinstance(v, str) else list(v)
-
-    hh, mm = a.release_time.split(":")
     weekdays = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
     wd = a.release_weekday.strip().lower()[:3]
     if wd not in weekdays:
         p.error(f"--release-weekday must be one of {list(weekdays)}")
+    hh, mm = a.release_time.split(":")
+
+    def d(s: Optional[str]) -> Optional[dt.date]:
+        return dt.date.fromisoformat(s) if s else None
 
     return Config(
-        email=email, password=password, instructor=a.instructor, discipline=a.discipline,
-        class_time=a.class_time, class_day=a.class_day, site_url=a.site_url, schedule_url=a.schedule_url,
-        release_weekday=weekdays[wd], release_time=dt.time(int(hh), int(mm)),
+        email=env("P2G_PELOTON__EMAIL") or env("STUDIO_EMAIL") or "",
+        password=env("P2G_PELOTON__PASSWORD") or env("STUDIO_PASSWORD") or "",
+        instructor=a.instructor, instructor_id=a.instructor_id, class_name=a.class_name,
+        class_time=a.class_time, class_day=a.class_day, window_start=d(a.window_start), window_end=d(a.window_end),
+        release_weekday=weekdays[wd], release_time=dt.time(int(hh), int(mm)), release_offset_days=a.release_offset_days,
         prestart_minutes=a.prestart_minutes, max_wait_minutes=a.max_wait_minutes,
-        poll_seconds=a.poll_seconds, poll_interval=a.poll_interval, waitlist=a.waitlist,
-        dry_run=a.dry_run, discover=a.discover, now=a.now, headful=a.headful, slow_mo=a.slow_mo,
-        storage_state=Path(a.storage_state), out_dir=Path(a.out_dir), selectors=selectors,
-        notify_url=os.environ.get("NOTIFY_URL") or None,
-        chromium_path=os.environ.get("PLAYWRIGHT_CHROMIUM_PATH") or None,
+        poll_seconds=a.poll_seconds, poll_interval=a.poll_interval, waitlist=a.waitlist, membership=a.membership,
+        dry_run=a.dry_run, discover=a.discover, now=a.now, login_only=a.login_only, headful=a.headful,
+        profile_dir=Path(a.profile_dir) if a.profile_dir else None,
+        storage_state=Path(a.storage_state), out_dir=Path(a.out_dir),
+        notify_url=env("NOTIFY_URL") or None, chromium_path=env("PLAYWRIGHT_CHROMIUM_PATH") or None,
     )
 
 
@@ -194,493 +186,642 @@ def parse_args(argv: Optional[list[str]] = None) -> Config:
 # Timing
 # ----------------------------------------------------------------------------
 def log(msg: str) -> None:
-    now = dt.datetime.now(ET).strftime("%H:%M:%S.%f")[:-3]
-    print(f"[{now} ET] {msg}", flush=True)
+    print(f"[{dt.datetime.now(ET).strftime('%H:%M:%S.%f')[:-3]} ET] {msg}", flush=True)
 
 
 def next_release(cfg: Config, now: Optional[dt.datetime] = None, grace: dt.timedelta = dt.timedelta(minutes=10)) -> dt.datetime:
-    """Next release instant in ET. A release that happened < `grace` ago still counts as 'next'
-    so a late-firing scheduler still joins the polling window."""
+    """Next release instant in ET. A release < `grace` ago still counts so a late cron joins the window."""
     now = now or dt.datetime.now(ET)
-    today = now.date()
-    days_ahead = (cfg.release_weekday - today.weekday()) % 7
-    candidate = dt.datetime.combine(today + dt.timedelta(days=days_ahead), cfg.release_time, tzinfo=ET)
+    days_ahead = (cfg.release_weekday - now.date().weekday()) % 7
+    candidate = dt.datetime.combine(now.date() + dt.timedelta(days=days_ahead), cfg.release_time, tzinfo=ET)
     if candidate + grace <= now:
         candidate = dt.datetime.combine(candidate.date() + dt.timedelta(days=7), cfg.release_time, tzinfo=ET)
     return candidate
 
 
+def release_window(cfg: Config, release: dt.datetime) -> tuple[dt.date, dt.date]:
+    start = cfg.window_start or (release.date() + dt.timedelta(days=cfg.release_offset_days))
+    end = cfg.window_end or (start + dt.timedelta(days=4))
+    return start, end
+
+
 def sleep_until(target: dt.datetime, offset: float = 0.0) -> None:
-    """Sleep until `target` (ET-aware), compensating for `offset` seconds (server - local)."""
     while True:
         remaining = (target - dt.datetime.now(ET)).total_seconds() - offset
         if remaining <= 0:
             return
         if remaining > 60:
-            log(f"sleeping, {remaining/60:.1f} min until {target.strftime('%a %H:%M:%S')} ET")
+            log(f"sleeping, {remaining/60:.1f} min until {target:%a %H:%M:%S} ET")
             time.sleep(min(remaining - 30, 300))
         elif remaining > 2:
             time.sleep(remaining - 1.5)
         else:
-            time.sleep(0.01)
+            time.sleep(0.005)
 
 
-def measure_clock_offset(context: BrowserContext, url: str) -> float:
-    """Return server_time - local_time in seconds using the HTTP Date header (1s precision)."""
+def measure_clock_offset(session: requests.Session) -> float:
+    """server_time - local_time in seconds (1 s precision) from the API's Date header."""
     try:
         t0 = time.time()
-        resp = context.request.head(url, timeout=10_000)
+        r = session.head(f"{API}/", timeout=10)
         t1 = time.time()
-        date_hdr = resp.headers.get("date")
-        if not date_hdr:
+        if "date" not in r.headers:
             return 0.0
-        server = parsedate_to_datetime(date_hdr).timestamp()
-        local_mid = (t0 + t1) / 2
-        return server - local_mid
+        return parsedate_to_datetime(r.headers["date"]).timestamp() - (t0 + t1) / 2
     except Exception as e:  # noqa: BLE001
         log(f"clock sync skipped: {e}")
         return 0.0
 
 
 # ----------------------------------------------------------------------------
-# Browser helpers
+# TeamUp API client
+# ----------------------------------------------------------------------------
+class TeamUp:
+    def __init__(self, token: Optional[str] = None, cookies: Optional[dict] = None, discover_log=None):
+        self.s = requests.Session()
+        self.s.headers.update({
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Teamup-Provider-ID": PROVIDER_ID,
+            "Teamup-Request-Mode": "customer",
+            "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"),
+            "Origin": TEAMUP_HOST,
+            "Referer": f"{FRAME_BASE}",
+        })
+        if token:
+            self.s.headers["Authorization"] = f"Token {token}"
+        if cookies:
+            for k, v in cookies.items():
+                self.s.cookies.set(k, v, domain="schedule.studio.onepeloton.com")
+        self.discover_log = discover_log
+
+    def _log(self, method: str, url: str, status: int, body: Any, payload: Any = None) -> None:
+        if self.discover_log is None:
+            return
+        row = {"ts": dt.datetime.now(ET).isoformat(timespec="milliseconds"), "method": method, "url": url, "status": status}
+        if payload is not None:
+            row["payload"] = payload
+        if method != "GET":
+            row["response"] = body if isinstance(body, (dict, list)) else str(body)[:500]
+        self.discover_log.write(json.dumps(row, default=str) + "\n")
+        self.discover_log.flush()
+
+    def get(self, path: str, params: Optional[dict] = None, timeout: float = 8) -> Any:
+        r = self.s.get(f"{API}/{path}", params=params, timeout=timeout)
+        body = _json(r)
+        self._log("GET", r.url, r.status_code, body)
+        r.raise_for_status()
+        return body
+
+    def post(self, path: str, payload: dict, timeout: float = 10) -> tuple[int, Any]:
+        r = self.s.post(f"{API}/{path}", json=payload, timeout=timeout)
+        body = _json(r)
+        self._log("POST", r.url, r.status_code, body, payload)
+        return r.status_code, body
+
+    # -- public lookups ------------------------------------------------------
+    def instructor_id(self, name: str) -> Optional[int]:
+        data = self.get("instructors", {"sort": "name", "page_size": 200})
+        for i in data.get("results", data if isinstance(data, list) else []):
+            if i.get("name", "").strip().lower() == name.strip().lower():
+                return int(i["id"])
+        return None
+
+    def events(self, instructor_id: int, start: dt.date, end: dt.date) -> list[dict]:
+        data = self.get("events", {
+            "instructors": instructor_id,
+            "local_starts_at_gte": f"{start:%Y-%m-%d}T00:00",
+            "local_starts_at_lte": f"{end:%Y-%m-%d}T23:59",
+            "status": "active", "sort": "start", "page_size": 100,
+            "expand": "instructors,active_registration_status,offering_type,offering_type.category,venue",
+            "fields": EVENT_FIELDS,
+        })
+        return data.get("results", [])
+
+    def bootstrap(self) -> dict:
+        return self.get("internal/frontends/customer/bootstrap_data", {"provider": PROVIDER_ID})
+
+    # -- booking -------------------------------------------------------------
+    def eligibility(self, customer: int, event_id: int) -> tuple[int, Any]:
+        return self.post("registration_eligibility/check", {"customer": customer, "event": event_id, "target_type": "class"})
+
+    def initiate_purchase(self, customer: int, event_id: int, return_to: str) -> tuple[int, Any]:
+        return self.post(f"events/{event_id}/initiate_purchase", {"customer": customer, "return_to": return_to, "select_drop_in": True})
+
+    def register(self, customer: int, event_id: int, customer_membership: Optional[int] = None) -> tuple[int, Any]:
+        payload: dict[str, Any] = {"customer": customer}
+        if customer_membership:
+            payload["customer_membership"] = customer_membership
+        return self.post(f"events/{event_id}/register", payload)
+
+    def join_waitlist(self, customer: int, event_id: int) -> tuple[int, Any]:
+        return self.post(f"events/{event_id}/join_waitlist", {"customer": customer})
+
+
+def _json(r: requests.Response) -> Any:
+    try:
+        return r.json()
+    except ValueError:
+        return r.text
+
+
+# ----------------------------------------------------------------------------
+# Event matching
+# ----------------------------------------------------------------------------
+def _norm(s: str) -> str:
+    return re.sub(r"[\s.]", "", s).lower()
+
+
+def event_matches(cfg: Config, ev: dict) -> bool:
+    starts = dt.datetime.fromisoformat(ev["starts_at"]).astimezone(ET)
+    if cfg.class_name and cfg.class_name.lower() not in ev.get("name", "").lower():
+        return False
+    if cfg.class_day and not starts.strftime("%A").lower().startswith(cfg.class_day.lower()[:3]):
+        return False
+    if cfg.class_time:
+        want = _norm(cfg.class_time)
+        have = {_norm(starts.strftime("%I:%M %p")).lstrip("0"), _norm(starts.strftime("%H:%M")), _norm(starts.strftime("%-I:%M%p"))}
+        if want.lstrip("0") not in have and want not in have:
+            return False
+    return True
+
+
+def describe(ev: dict) -> str:
+    starts = dt.datetime.fromisoformat(ev["starts_at"]).astimezone(ET)
+    full = ev.get("is_full")
+    return (f"{ev['id']} {starts:%a %m/%d %-I:%M %p} {ev.get('name','?')} "
+            f"[{'FULL' if full else 'open'} {ev.get('occupancy', '?')}/{ev.get('max_occupancy', '?')}, waitlist {ev.get('waiting_count', 0)}]")
+
+
+# ----------------------------------------------------------------------------
+# Booker
 # ----------------------------------------------------------------------------
 class Booker:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.sel = cfg.selectors
-        self.cfg.out_dir.mkdir(parents=True, exist_ok=True)
-        self.cfg.storage_state.parent.mkdir(parents=True, exist_ok=True)
-        self.requests_log = None
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        cfg.storage_state.parent.mkdir(parents=True, exist_ok=True)
+        self.discover_log = open(cfg.out_dir / "api_requests.jsonl", "a", encoding="utf-8") if cfg.discover else None
         self.shot_idx = 0
-        self.offset = 0.0
+        self.token: Optional[str] = None
+        self.customer: Optional[int] = None
+        self.lock = threading.Lock()
 
-    # -- utilities ---------------------------------------------------------
+    # -- helpers --------------------------------------------------------------
     def shot(self, page: Page, label: str) -> None:
         self.shot_idx += 1
-        path = self.cfg.out_dir / f"{self.shot_idx:02d}_{label}.png"
         try:
-            page.screenshot(path=str(path), full_page=False)
+            page.screenshot(path=str(self.cfg.out_dir / f"{self.shot_idx:02d}_{label}.png"))
         except PlaywrightError:
             pass
 
-    def first_visible(self, page: Page, key: str, timeout: float = 1500, scope: Optional[Locator] = None) -> Optional[Locator]:
-        """First selector in `key` that resolves to a visible element.
+    def teamup_frame(self, page: Page, timeout: float = 30) -> Optional[Frame]:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for f in page.frames:
+                if "schedule.studio.onepeloton.com" in f.url and "/c/" in f.url:
+                    return f
+            time.sleep(0.25)
+        return None
 
-        `timeout` (ms) is a total budget shared by all candidate selectors, not a
-        per-selector wait, so a long candidate list stays cheap inside the poll loop."""
-        root = scope if scope is not None else page
-        deadline = time.time() + timeout / 1000.0
+    def visible(self, root, selectors: list[str], timeout_ms: int = 1500):
+        deadline = time.time() + timeout_ms / 1000
         while True:
-            for s in self.sel.get(key, []):
+            for s in selectors:
                 try:
                     loc = root.locator(s).first
                     if loc.is_visible():
                         return loc
                 except PlaywrightError:
-                    continue
+                    pass
             if time.time() >= deadline:
                 return None
             time.sleep(0.1)
 
-    def click_if_present(self, page: Page, key: str, timeout: float = 800) -> bool:
-        loc = self.first_visible(page, key, timeout)
-        if loc is None:
-            return False
+    # -- session capture -------------------------------------------------------
+    def attach_capture(self, page: Page) -> None:
+        """Harvest the TeamUp Authorization token from the frame's own API calls."""
+        def on_request(req):
+            if "/api/v2/" not in req.url or "schedule.studio.onepeloton.com" not in req.url:
+                return
+            auth = req.headers.get("authorization", "")
+            if auth.startswith("Token "):
+                with self.lock:
+                    self.token = auth.split(" ", 1)[1]
+            if self.discover_log and req.method != "GET":
+                self.discover_log.write(json.dumps({
+                    "ts": dt.datetime.now(ET).isoformat(timespec="milliseconds"), "source": "browser",
+                    "method": req.method, "url": req.url, "post_data": (req.post_data or "")[:2000],
+                }) + "\n")
+        page.on("request", on_request)
+
+    def frame_logged_in(self, frame: Frame) -> bool:
         try:
-            loc.click(timeout=3000)
-            return True
+            txt = frame.evaluate("() => document.body ? document.body.innerText : ''")
         except PlaywrightError:
             return False
+        return "LOG IN / REGISTER" not in txt.upper()
 
-    def is_logged_in(self, page: Page) -> bool:
-        return self.first_visible(page, "logged_in_marker", timeout=2500) is not None
-
-    # -- discovery ---------------------------------------------------------
-    def attach_discovery(self, page: Page) -> None:
-        if not self.cfg.discover:
-            return
-        self.requests_log = open(self.cfg.out_dir / "requests.jsonl", "a", encoding="utf-8")
-
-        def on_response(resp):
-            req = resp.request
-            if req.resource_type in ("image", "font", "media", "stylesheet"):
-                return
-            row = {
-                "ts": dt.datetime.now(ET).isoformat(timespec="milliseconds"),
-                "method": req.method,
-                "url": req.url,
-                "status": resp.status,
-                "type": req.resource_type,
-            }
-            if req.resource_type in ("xhr", "fetch") and req.method in ("POST", "PUT", "PATCH"):
-                body = req.post_data or ""
-                # never persist the password
-                if self.cfg.password and self.cfg.password in body:
-                    body = body.replace(self.cfg.password, "***")
-                row["post_data"] = body[:2000]
-            self.requests_log.write(json.dumps(row) + "\n")
-            self.requests_log.flush()
-
-        page.on("response", on_response)
-
-    def dump_dom(self, page: Page, label: str) -> None:
-        if not self.cfg.discover:
-            return
+    # -- login ----------------------------------------------------------------
+    def login(self, page: Page, context: BrowserContext) -> None:
+        cfg = self.cfg
+        log(f"opening {SITE_URL}")
+        page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60_000)
+        for s in ("#fides-accept-all-button", "button:has-text('Accept all')"):
+            try:
+                page.locator(s).first.click(timeout=1500)
+                break
+            except PlaywrightError:
+                pass
+        frame = self.teamup_frame(page)
+        if frame is None:
+            raise SystemExit("TeamUp schedule frame did not load")
         try:
-            data = page.evaluate(
-                """() => ({
-                    url: location.href,
-                    title: document.title,
-                    links: [...document.querySelectorAll('a[href]')].map(a => ({text: a.innerText.trim().slice(0,120), href: a.href})),
-                    buttons: [...document.querySelectorAll('button, [role=button], input[type=submit]')]
-                        .map(b => ({text: (b.innerText || b.value || b.getAttribute('aria-label') || '').trim().slice(0,120),
-                                    id: b.id || null, cls: (b.className || '').toString().slice(0,200),
-                                    testid: b.getAttribute('data-testid')})),
-                    scripts: [...document.scripts].map(s => s.src).filter(Boolean),
-                    forms: [...document.forms].map(f => ({action: f.action, method: f.method,
-                        fields: [...f.elements].map(e => ({name: e.name, type: e.type, id: e.id}))})),
-                })"""
-            )
-            (self.cfg.out_dir / f"dom_{label}.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except PlaywrightError as e:
-            log(f"dom dump failed: {e}")
-
-    # -- login -------------------------------------------------------------
-    def ensure_logged_in(self, page: Page, context: BrowserContext) -> None:
-        log(f"opening {self.cfg.site_url}")
-        page.goto(self.cfg.site_url, wait_until="domcontentloaded", timeout=45_000)
-        self.click_if_present(page, "cookie_accept")
-        self.dump_dom(page, "landing")
-        self.shot(page, "landing")
-
-        if self.is_logged_in(page):
-            log("already logged in (storage state reused)")
-            return
-
-        if not (self.cfg.email and self.cfg.password):
-            raise SystemExit("Not logged in and no credentials in P2G_PELOTON__EMAIL / P2G_PELOTON__PASSWORD")
-
-        log("logging in")
-        if not self.click_if_present(page, "login_trigger", timeout=4000):
-            log("no login button found; assuming login form is on the page")
-        page.wait_for_load_state("domcontentloaded")
-        self.dump_dom(page, "login")
-        self.shot(page, "login")
-
-        email_box = self.first_visible(page, "email", timeout=15_000)
-        if email_box is None:
-            raise SystemExit("could not find the email field; run with --discover --headful and adjust --selectors")
-        email_box.fill(self.cfg.email)
-
-        pw_box = self.first_visible(page, "password", timeout=3000)
-        if pw_box is None:
-            # two-step login: submit email first
-            self.click_if_present(page, "login_submit", timeout=3000)
-            pw_box = self.first_visible(page, "password", timeout=15_000)
-        if pw_box is None:
-            raise SystemExit("could not find the password field; adjust --selectors")
-        pw_box.fill(self.cfg.password)
-        if not self.click_if_present(page, "login_submit", timeout=3000):
-            pw_box.press("Enter")
-
-        try:
-            page.wait_for_load_state("networkidle", timeout=20_000)
+            frame.wait_for_load_state("networkidle", timeout=20_000)
         except PlaywrightTimeout:
             pass
-        # Login may bounce through members.onepeloton.com / auth0 and back.
-        for _ in range(20):
-            if self.is_logged_in(page):
-                break
-            time.sleep(0.5)
-        self.shot(page, "after_login")
-        self.dump_dom(page, "after_login")
-        if not self.is_logged_in(page):
-            if page.url.rstrip("/") != self.cfg.site_url.rstrip("/"):
-                page.goto(self.cfg.site_url, wait_until="domcontentloaded")
-            if not self.is_logged_in(page):
-                log("WARNING: could not confirm logged-in state (marker not found). Continuing anyway; check screenshots.")
-        context.storage_state(path=str(self.cfg.storage_state))
-        log(f"saved session to {self.cfg.storage_state}")
+        self.shot(page, "landing")
 
-    # -- schedule ----------------------------------------------------------
-    def open_schedule(self, page: Page) -> None:
-        if self.cfg.schedule_url:
-            log(f"opening schedule deeplink {self.cfg.schedule_url}")
-            page.goto(self.cfg.schedule_url, wait_until="domcontentloaded", timeout=45_000)
+        if self.frame_logged_in(frame):
+            log("already logged in (saved session reused)")
         else:
-            self.click_if_present(page, "schedule_link", timeout=3000)
-            page.wait_for_load_state("domcontentloaded")
-        self.click_if_present(page, "day_view", timeout=1500)
-        self.dump_dom(page, "schedule")
-        self.shot(page, "schedule")
-
-    def matching_cards(self, page: Page) -> list[Locator]:
-        """Smallest ancestors of each instructor-name match that contain an action button."""
-        cfg = self.cfg
-        name_re = re.compile(re.escape(cfg.instructor), re.I)
-        matches = page.get_by_text(name_re)
-        cards: list[Locator] = []
-        try:
-            n = min(matches.count(), 25)
-        except PlaywrightError:
-            return cards
-        for i in range(n):
-            node = matches.nth(i)
-            card = None
-            for _ in range(8):
-                try:
-                    if node.locator("button, a[role='button'], a").count() > 0:
-                        card = node
-                        break
-                    node = node.locator("xpath=..")
-                except PlaywrightError:
-                    break
-            if card is None:
-                continue
-            try:
-                text = card.inner_text(timeout=1500)
-            except PlaywrightError:
-                continue
-            if cfg.discipline and cfg.discipline.lower() not in text.lower():
-                continue
-            if cfg.class_time and self._norm(cfg.class_time) not in self._norm(text):
-                continue
-            if cfg.class_day and cfg.class_day.lower() not in text.lower():
-                continue
-            cards.append(card)
-        return cards
-
-    @staticmethod
-    def _norm(s: str) -> str:
-        return re.sub(r"\s+", "", s).lower().replace(".", "")
-
-    def action_button(self, card: Locator, allow_waitlist: bool) -> tuple[Optional[Locator], str]:
-        buttons = card.locator("button, a")
-        try:
-            n = min(buttons.count(), 15)
-        except PlaywrightError:
-            return None, ""
-        waitlist_btn = None
-        for i in range(n):
-            b = buttons.nth(i)
-            try:
-                if not b.is_visible() or not b.is_enabled():
-                    continue
-                label = (b.inner_text(timeout=500) or b.get_attribute("aria-label") or "").strip()
-            except PlaywrightError:
-                continue
-            if WAITLIST_WORDS.search(label):
-                waitlist_btn = waitlist_btn or b
-                continue
-            if BOOK_WORDS.search(label):
-                return b, "book"
-        if allow_waitlist and waitlist_btn is not None:
-            return waitlist_btn, "waitlist"
-        return None, ""
-
-    # -- booking -----------------------------------------------------------
-    def complete_checkout(self, page: Page, kind: str) -> bool:
-        """After clicking Book: click through confirm/pay steps until a success marker appears."""
-        deadline = time.time() + 45
-        while time.time() < deadline:
-            if self.first_visible(page, "success_marker", timeout=700) is not None:
-                return True
-            if self.first_visible(page, "full_marker", timeout=200) is not None:
-                log("class reported full during checkout")
-                return False
-            if self.cfg.dry_run:
-                confirm = self.first_visible(page, "confirm_button", timeout=700)
-                if confirm is not None:
-                    log(f"DRY RUN: would click '{confirm.inner_text()[:40]}' to finish the {kind}")
-                    self.shot(page, "dry_run_confirm")
-                    return True
+            if not (cfg.email and cfg.password):
+                if cfg.login_only and cfg.headful:
+                    log("no credentials in env; log in by hand in the browser window (you have 5 minutes)")
+                    for _ in range(600):
+                        time.sleep(0.5)
+                        f = self.teamup_frame(page, timeout=1)
+                        if f and self.frame_logged_in(f):
+                            break
+                else:
+                    raise SystemExit("not logged in and no credentials in P2G_PELOTON__EMAIL / P2G_PELOTON__PASSWORD")
             else:
-                if self.click_if_present(page, "confirm_button", timeout=700):
-                    log("clicked a confirm/pay step")
-                    self.shot(page, "confirm_step")
-                    try:
-                        page.wait_for_load_state("domcontentloaded", timeout=5000)
-                    except PlaywrightTimeout:
-                        pass
+                log("logging in through Peloton (Auth0)")
+                page.get_by_role("button", name=re.compile(r"log ?in", re.I)).first.click(timeout=10_000)
+                page.wait_for_url(re.compile(r"auth\.onepeloton\.com"), timeout=30_000)
+                email = self.visible(page, ["input[type='email']", "input[name='username']", "input[name='email']",
+                                            "input[autocomplete='username']", "input[id*='email' i]"], 30_000)
+                if email is None:
+                    self.shot(page, "login_no_email_field")
+                    raise SystemExit("could not find the email field on auth.onepeloton.com (bot challenge?). "
+                                     "Run once with --headful --login-only --profile-dir and log in by hand.")
+                email.fill(cfg.email)
+                pw = self.visible(page, ["input[type='password']"], 3000)
+                if pw is None:
+                    submit = self.visible(page, ["button[type='submit']", "button:has-text('Continue')", "button:has-text('Next')"], 3000)
+                    if submit:
+                        submit.click()
+                    pw = self.visible(page, ["input[type='password']"], 20_000)
+                if pw is None:
+                    self.shot(page, "login_no_password_field")
+                    raise SystemExit("could not find the password field; adjust the login step")
+                pw.fill(cfg.password)
+                submit = self.visible(page, ["button[type='submit']", "button:has-text('Log in')", "button:has-text('Log In')",
+                                             "button:has-text('Continue')"], 3000)
+                if submit:
+                    submit.click()
+                else:
+                    pw.press("Enter")
+                page.wait_for_url(re.compile(r"studio\.onepeloton\.com"), timeout=60_000)
+                log("back on studio.onepeloton.com, waiting for the schedule frame to pick up the session")
+                frame = self.teamup_frame(page)
+                for _ in range(60):
+                    if frame and self.frame_logged_in(frame):
+                        break
+                    time.sleep(0.5)
+                    frame = self.teamup_frame(page, timeout=1)
+            self.shot(page, "after_login")
+
+        frame = self.teamup_frame(page)
+        if frame is None or not self.frame_logged_in(frame):
+            self.shot(page, "login_unconfirmed")
+            raise SystemExit("login did not stick (frame still shows LOG IN / REGISTER); see screenshots")
+
+        # The frame's API calls carry the customer session token; make it issue one.
+        self.goto_frame(frame, self.release_dates_for_frame())
+        for _ in range(40):
+            if self.token:
+                break
+            time.sleep(0.25)
+        if not self.token:
+            # Fallback: ask bootstrap_data with the browser's cookies; it returns the session's access_token.
+            try:
+                r = context.request.get(f"{API}/internal/frontends/customer/bootstrap_data?provider={PROVIDER_ID}",
+                                        headers={"Teamup-Provider-ID": PROVIDER_ID, "Teamup-Request-Mode": "customer",
+                                                 "Accept": "application/json"})
+                self.token = (r.json() or {}).get("access_token") if r.ok else None
+            except PlaywrightError:
+                pass
+        if not self.token:
+            raise SystemExit("could not capture the TeamUp session token from the frame's API calls")
+        api = self.api()
+        boot = api.bootstrap()
+        cust = boot.get("current_customer")
+        self.customer = int(cust["id"] if isinstance(cust, dict) else cust) if cust else None
+        if not self.customer:
+            raise SystemExit(f"TeamUp session has no customer (bootstrap_data: {json.dumps(boot)[:300]})")
+        log(f"session ready: customer {self.customer}, token captured")
+        try:
+            context.storage_state(path=str(cfg.storage_state))
+        except PlaywrightError:
+            pass
+
+    def release_dates_for_frame(self) -> tuple[dt.date, dt.date]:
+        start, end = release_window(self.cfg, next_release(self.cfg) if not self.cfg.now else dt.datetime.now(ET))
+        return start, end
+
+    def goto_frame(self, frame: Frame, dates: tuple[dt.date, dt.date], event_id: Optional[int] = None) -> None:
+        start, end = dates
+        q = {"startdate": f"{start:%Y-%m-%d}", "enddate": f"{end:%Y-%m-%d}", "venues": "", "category": "",
+             "instructors": self.cfg.instructor_id or "", "offering_types": "", "age_restrictions": "", "date": f"{start:%Y-%m-%d}"}
+        if event_id:
+            q["e"] = event_id
+        url = f"{FRAME_BASE}?{urlencode(q)}"
+        try:
+            frame.evaluate("u => { location.href = u }", url)
+            frame.wait_for_load_state("domcontentloaded", timeout=15_000)
+        except PlaywrightError as e:
+            log(f"frame navigation failed: {e}")
+
+    def api(self) -> TeamUp:
+        return TeamUp(self.token, discover_log=self.discover_log)
+
+    # -- booking ----------------------------------------------------------------
+    def book_event(self, api: TeamUp, ev: dict, page: Page) -> str:
+        """Returns booked | waitlisted | full | rejected."""
+        cfg = self.cfg
+        eid = int(ev["id"])
+        if ev.get("is_full"):
+            if not cfg.waitlist:
+                return "full"
+            if cfg.dry_run:
+                log(f"DRY RUN: would join the waitlist for {describe(ev)}")
+                return "waitlisted"
+            st, body = api.join_waitlist(self.customer, eid)
+            log(f"join_waitlist -> {st} {json.dumps(body)[:200]}")
+            return "waitlisted" if st < 300 else "rejected"
+
+        if cfg.dry_run:
+            log(f"DRY RUN: would book {describe(ev)}")
+            st, body = api.eligibility(self.customer, eid)
+            log(f"eligibility check -> {st} {json.dumps(body)[:400]}")
+            return "booked"
+
+        if cfg.membership:
+            st, body = api.register(self.customer, eid, self._membership_id(api, eid))
+            log(f"register -> {st} {json.dumps(body)[:300]}")
+            if st < 300:
+                return "booked"
+            log("register rejected, falling back to drop-in purchase")
+
+        return_to = f"{FRAME_BASE}?e={eid}"
+        st, body = api.initiate_purchase(self.customer, eid, return_to)
+        log(f"initiate_purchase -> {st} {json.dumps(body)[:300]}")
+        if st >= 300:
+            code = body.get("code") if isinstance(body, dict) else None
+            if code in ("event_full", "registrations_full"):
+                return "full"
+            return "rejected"
+        next_url = body.get("next_url") if isinstance(body, dict) else None
+        if next_url:
+            return "booked" if self.finish_checkout(page, next_url) else "rejected"
+        return "booked"
+
+    def _membership_id(self, api: TeamUp, eid: int) -> Optional[int]:
+        st, body = api.eligibility(self.customer, eid)
+        if st >= 300 or not isinstance(body, dict):
+            return None
+        for opt in body.get("registration_options", []) or []:
+            cm = opt.get("customer_membership")
+            if cm:
+                return int(cm["id"] if isinstance(cm, dict) else cm)
+        return None
+
+    def finish_checkout(self, page: Page, next_url: str) -> bool:
+        """Open TeamUp's checkout page and confirm payment with the card on file."""
+        if next_url.startswith("/"):
+            next_url = TEAMUP_HOST + next_url
+        log(f"opening checkout {next_url}")
+        try:
+            page.goto(next_url, wait_until="domcontentloaded", timeout=30_000)
+        except PlaywrightError as e:
+            log(f"checkout navigation failed: {e}")
+            return False
+        self.shot(page, "checkout")
+        deadline = time.time() + 90
+        confirm_sel = ["button:has-text('Confirm and pay')", "button:has-text('Pay now')", "button:has-text('Pay')",
+                       "button:has-text('Complete purchase')", "button:has-text('Complete')", "button:has-text('Confirm')",
+                       "button:has-text('Book')", "button:has-text('Agree')", "button:has-text('Accept')", "button[type='submit']"]
+        success_re = re.compile(r"booked successfully|you.?re booked|booking confirmed|thank you|confirmed|see you", re.I)
+        while time.time() < deadline:
+            try:
+                txt = page.evaluate("() => document.body.innerText")
+            except PlaywrightError:
+                txt = ""
+            if success_re.search(txt):
+                self.shot(page, "checkout_success")
+                return True
+            if re.search(r"class is full|sold out|no longer available", txt, re.I):
+                log("checkout says the class is no longer available")
+                return False
+            btn = self.visible(page, confirm_sel, 700)
+            if btn is not None:
+                try:
+                    label = btn.inner_text(timeout=500).strip()
+                    btn.click(timeout=3000)
+                    log(f"clicked '{label}' on checkout")
+                    self.shot(page, "checkout_click")
+                    time.sleep(1.0)
+                except PlaywrightError:
+                    pass
             time.sleep(0.3)
-        log("checkout did not reach a success marker within 45s")
+        log("checkout did not confirm within 90s; check screenshots and your email")
         return False
 
-    def try_once(self, page: Page) -> tuple[str, Optional[str]]:
-        """One booking attempt. Returns (status, detail): status in booked|waitlisted|full|none|error."""
-        cards = self.matching_cards(page)
-        if not cards:
-            return "none", "no card for instructor"
-        full_seen = False
-        for card in cards:
-            btn, kind = self.action_button(card, allow_waitlist=self.cfg.waitlist)
-            if btn is None:
-                try:
-                    txt = card.inner_text(timeout=500)
-                except PlaywrightError:
-                    txt = ""
-                if re.search(r"sold out|full|no spots", txt, re.I):
-                    full_seen = True
-                continue
-            try:
-                label = btn.inner_text(timeout=500)
-            except PlaywrightError:
-                label = kind
-            log(f"clicking '{label.strip()}' on card: {card.inner_text(timeout=500)[:90]!r}")
-            self.shot(page, f"click_{kind}")
-            try:
-                btn.click(timeout=4000)
-            except PlaywrightError as e:
-                return "error", f"click failed: {e}"
-            self.dump_dom(page, f"after_click_{kind}")
-            if self.complete_checkout(page, kind):
-                self.shot(page, "success")
-                self.dump_dom(page, "success")
-                return ("waitlisted" if kind == "waitlist" else "booked"), label.strip()
-            self.shot(page, "checkout_failed")
-            # back to the schedule for another go
-            try:
-                page.go_back(wait_until="domcontentloaded", timeout=8000)
-            except PlaywrightError:
-                self.open_schedule(page)
-            return "error", "checkout did not confirm"
-        return ("full", "class full, waitlist disabled") if full_seen else ("none", "card found but no book/waitlist button yet")
+    def click_fallback(self, page: Page, ev: dict) -> str:
+        """Open the booking modal inside the TeamUp frame and click Book / Join waitlist."""
+        frame = self.teamup_frame(page)
+        if frame is None:
+            return "rejected"
+        start, end = self.release_dates_for_frame()
+        self.goto_frame(frame, (start, end), event_id=int(ev["id"]))
+        time.sleep(1.0)
+        self.shot(page, "modal")
+        btn = self.visible(frame, ["button:has-text('Book')", "button:has-text('Register')", "button:has-text('Reserve')"], 4000)
+        kind = "booked"
+        if btn is None and self.cfg.waitlist:
+            btn = self.visible(frame, ["button:has-text('Join waitlist')", "button:has-text('Join Waitlist')", "button:has-text('Waitlist')"], 2000)
+            kind = "waitlisted"
+        if btn is None:
+            return "rejected"
+        if self.cfg.dry_run:
+            log(f"DRY RUN: would click '{btn.inner_text()}' in the booking modal")
+            return kind
+        btn.click()
+        self.shot(page, "modal_clicked")
+        # drop-in flow leaves the frame for a checkout page; follow it on the main page
+        time.sleep(2.0)
+        for f in page.frames:
+            if "checkout" in f.url or "/purchase" in f.url:
+                return "booked" if self.finish_checkout(page, f.url) else "rejected"
+        try:
+            txt = frame.evaluate("() => document.body.innerText")
+        except PlaywrightError:
+            txt = ""
+        if re.search(r"booked successfully|joined waitlist|you.?re on the waitlist", txt, re.I):
+            return kind
+        return "rejected"
 
-    def poll(self, page: Page, release: dt.datetime) -> str:
-        end = max(release, dt.datetime.now(ET)) + dt.timedelta(seconds=self.cfg.poll_seconds)
+    # -- polling -----------------------------------------------------------------
+    def poll(self, api: TeamUp, page: Page, release: dt.datetime) -> str:
+        cfg = self.cfg
+        start, end = release_window(cfg, release)
+        end_time = max(release, dt.datetime.now(ET)) + dt.timedelta(seconds=cfg.poll_seconds)
+        log(f"polling {cfg.instructor} (id {cfg.instructor_id}) for classes {start} .. {end}")
         attempt = 0
-        last_detail = None
-        while dt.datetime.now(ET) < end:
+        tried: set[int] = set()
+        last_msg = None
+        while dt.datetime.now(ET) < end_time:
             attempt += 1
-            status, detail = self.try_once(page)
-            if status in ("booked", "waitlisted"):
-                log(f"SUCCESS ({status}) after {attempt} attempt(s): {detail}")
-                return status
-            if detail != last_detail:
-                log(f"attempt {attempt}: {status} - {detail}")
-                last_detail = detail
-            if status == "full" and not self.cfg.waitlist:
-                # keep polling: spots get released when payments fail / people cancel
-                pass
-            time.sleep(self.cfg.poll_interval)
             try:
-                if self.cfg.schedule_url:
-                    page.goto(self.cfg.schedule_url, wait_until="domcontentloaded", timeout=15_000)
-                else:
-                    page.reload(wait_until="domcontentloaded", timeout=15_000)
-                self.click_if_present(page, "day_view", timeout=300)
-            except PlaywrightError as e:
-                log(f"reload failed: {e}")
-                time.sleep(1)
-        log(f"gave up after {attempt} attempts / {self.cfg.poll_seconds:.0f}s")
+                events = api.events(cfg.instructor_id, start, end)
+            except requests.RequestException as e:
+                msg = f"events request failed: {e}"
+                if msg != last_msg:
+                    log(msg)
+                    last_msg = msg
+                time.sleep(cfg.poll_interval)
+                continue
+            candidates = [e for e in events if event_matches(cfg, e) and int(e["id"]) not in tried]
+            if not candidates:
+                msg = f"no matching class yet ({len(events)} event(s) for instructor in window)"
+                if msg != last_msg:
+                    log(f"attempt {attempt}: {msg}")
+                    last_msg = msg
+                time.sleep(cfg.poll_interval)
+                continue
+            # prefer open classes, earliest first
+            candidates.sort(key=lambda e: (bool(e.get("is_full")), e["starts_at"]))
+            for ev in candidates:
+                log(f"attempt {attempt}: trying {describe(ev)}")
+                result = self.book_event(api, ev, page)
+                if result == "rejected":
+                    log("API path rejected; trying the click fallback")
+                    result = self.click_fallback(page, ev)
+                if result in ("booked", "waitlisted"):
+                    log(f"SUCCESS ({result}): {describe(ev)}")
+                    return result
+                if result == "full":
+                    log("class is full" + ("" if cfg.waitlist else " (waitlist disabled, keep polling for a released spot)"))
+                tried.add(int(ev["id"])) if result == "rejected" else None
+            time.sleep(cfg.poll_interval)
+        log(f"gave up after {attempt} polls / {cfg.poll_seconds:.0f}s")
         return "not_booked"
 
-    # -- orchestration -----------------------------------------------------
+    # -- orchestration --------------------------------------------------------------
     def run(self) -> int:
         cfg = self.cfg
         release = next_release(cfg)
-        now = dt.datetime.now(ET)
-        if not cfg.now:
-            until = (release - now).total_seconds() / 60
-            if until > cfg.max_wait_minutes:
-                log(f"next release is {release:%a %Y-%m-%d %H:%M} ET ({until:.0f} min away) > --max-wait-minutes {cfg.max_wait_minutes:.0f}; exiting")
-                return EXIT_NO_RELEASE_SOON
-            log(f"targeting release {release:%a %Y-%m-%d %H:%M} ET; pre-start at T-{cfg.prestart_minutes:g} min")
-            sleep_until(release - dt.timedelta(minutes=cfg.prestart_minutes))
-        else:
+        if cfg.now or cfg.login_only:
             release = dt.datetime.now(ET)
-            log("--now: starting immediately")
+            log("starting immediately")
+        else:
+            until = (release - dt.datetime.now(ET)).total_seconds() / 60
+            if until > cfg.max_wait_minutes:
+                log(f"next release {release:%a %Y-%m-%d %H:%M} ET is {until:.0f} min away (> {cfg.max_wait_minutes:.0f}); exiting")
+                return EXIT_NO_RELEASE_SOON
+            log(f"targeting release {release:%a %Y-%m-%d %H:%M} ET (classes {release_window(cfg, release)[0]} .. {release_window(cfg, release)[1]}); "
+                f"pre-start at T-{cfg.prestart_minutes:g} min")
+            sleep_until(release - dt.timedelta(minutes=cfg.prestart_minutes))
 
+        public = TeamUp(discover_log=self.discover_log)
+        if not cfg.instructor_id:
+            cfg.instructor_id = public.instructor_id(cfg.instructor)
+            if not cfg.instructor_id:
+                log(f"instructor {cfg.instructor!r} not found in TeamUp instructor list")
+                return EXIT_ERROR
+            log(f"instructor {cfg.instructor!r} -> id {cfg.instructor_id}")
+        offset = measure_clock_offset(public.s)
+        log(f"clock offset vs server: {offset:+.1f}s")
+
+        status = "error"
         with sync_playwright() as pw:
-            launch_kwargs = {"headless": not cfg.headful, "slow_mo": cfg.slow_mo}
-            if cfg.chromium_path:
-                launch_kwargs["executable_path"] = cfg.chromium_path
-            browser: Browser = pw.chromium.launch(**launch_kwargs)
-            ctx_kwargs = {
-                "viewport": {"width": 1366, "height": 900},
-                "timezone_id": "America/New_York",
-                "locale": "en-US",
+            ctx_kwargs: dict[str, Any] = {
+                "viewport": {"width": 1366, "height": 1000}, "timezone_id": "America/New_York", "locale": "en-US",
                 "user_agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                                "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"),
             }
-            if cfg.storage_state.exists():
-                ctx_kwargs["storage_state"] = str(cfg.storage_state)
-            context = browser.new_context(**ctx_kwargs)
+            launch_kwargs: dict[str, Any] = {"headless": not cfg.headful}
+            if cfg.chromium_path:
+                launch_kwargs["executable_path"] = cfg.chromium_path
+            if cfg.profile_dir:
+                cfg.profile_dir.mkdir(parents=True, exist_ok=True)
+                context = pw.chromium.launch_persistent_context(str(cfg.profile_dir), **launch_kwargs, **ctx_kwargs)
+                browser = None
+            else:
+                browser = pw.chromium.launch(**launch_kwargs)
+                if cfg.storage_state.exists():
+                    ctx_kwargs["storage_state"] = str(cfg.storage_state)
+                context = browser.new_context(**ctx_kwargs)
             context.set_default_timeout(10_000)
-            page = context.new_page()
-            self.attach_discovery(page)
-
+            page = context.pages[0] if context.pages else context.new_page()
+            self.attach_capture(page)
             try:
-                self.ensure_logged_in(page, context)
-                self.open_schedule(page)
-                if cfg.site_url.startswith("http"):
-                    self.offset = measure_clock_offset(context, cfg.site_url)
-                    log(f"clock offset vs server: {self.offset:+.1f}s")
-
-                cards = self.matching_cards(page)
-                log(f"pre-release: found {len(cards)} card(s) matching {cfg.instructor!r}"
-                    + (f" / {cfg.discipline}" if cfg.discipline else "")
-                    + (f" / {cfg.class_time}" if cfg.class_time else ""))
-                for c in cards[:5]:
-                    try:
-                        log("  - " + " | ".join(c.inner_text(timeout=500).split("\n"))[:140])
-                    except PlaywrightError:
-                        pass
-
-                if not cfg.now:
-                    # one more refresh at T-20s so the session/CSRF are fresh, then wait for T-0
-                    sleep_until(release - dt.timedelta(seconds=20), self.offset)
-                    try:
-                        page.reload(wait_until="domcontentloaded", timeout=15_000)
-                        self.click_if_present(page, "day_view", timeout=300)
-                    except PlaywrightError:
-                        pass
-                    sleep_until(release, self.offset)
-                    log("T-0: polling")
-
-                status = self.poll(page, release)
+                self.login(page, context)
+                if cfg.login_only:
+                    log("login saved; done")
+                    status = "login_only"
+                else:
+                    api = self.api()
+                    if not cfg.now:
+                        sleep_until(release - dt.timedelta(seconds=15), offset)
+                        # keep the browser session warm and re-arm the token right before T-0
+                        frame = self.teamup_frame(page, timeout=2)
+                        if frame:
+                            self.goto_frame(frame, release_window(cfg, release))
+                        time.sleep(0.5)
+                        api = self.api()
+                        sleep_until(release, offset)
+                        log("T-0")
+                    status = self.poll(api, page, release)
             except SystemExit as e:
                 log(f"FATAL: {e}")
                 self.shot(page, "fatal")
-                status = "error"
             except Exception as e:  # noqa: BLE001
                 log(f"ERROR: {type(e).__name__}: {e}")
                 self.shot(page, "error")
-                status = "error"
             finally:
                 try:
                     context.storage_state(path=str(cfg.storage_state))
                 except PlaywrightError:
                     pass
-                if self.requests_log:
-                    self.requests_log.close()
+                if self.discover_log:
+                    self.discover_log.close()
                     log(f"discovery written to {cfg.out_dir}")
-                browser.close()
+                context.close()
+                if browser:
+                    browser.close()
 
-        self.notify(f"Peloton Studios booker: {status} for {cfg.instructor} ({release:%a %m/%d %H:%M} ET)")
+        if status == "login_only":
+            return EXIT_BOOKED
+        self.notify(f"Peloton Studios booker: {status} for {cfg.instructor} (release {release:%a %m/%d %H:%M} ET)")
         if status in ("booked", "waitlisted"):
             return EXIT_BOOKED
-        if status == "error":
-            return EXIT_ERROR
-        return EXIT_NOT_BOOKED
+        return EXIT_ERROR if status == "error" else EXIT_NOT_BOOKED
 
     def notify(self, text: str) -> None:
         log(text)
         if not self.cfg.notify_url:
             return
         try:
-            import urllib.request
-            req = urllib.request.Request(self.cfg.notify_url, data=text.encode(), method="POST",
-                                         headers={"Content-Type": "text/plain"})
-            urllib.request.urlopen(req, timeout=10).read()
+            requests.post(self.cfg.notify_url, data=text.encode(), headers={"Content-Type": "text/plain"}, timeout=10)
         except Exception as e:  # noqa: BLE001
             log(f"notify failed: {e}")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    cfg = parse_args(argv)
-    return Booker(cfg).run()
+    return Booker(parse_args(argv)).run()
 
 
 if __name__ == "__main__":

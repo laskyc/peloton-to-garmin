@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Cron / launchd wrapper. Loads ./.env (not committed) and runs the booker,
-# appending output to logs/. Example crontab (local machine, Eastern time):
+# Cron / launchd wrapper. Loads ./.env (git-ignored) and runs the booker.
+# Example crontab (machine in any timezone; the script computes Eastern time itself):
 #   CRON_TZ=America/New_York
 #   35 11 * * 4  /path/to/peloton-to-garmin/studio-booking/run.sh >> /path/to/peloton-to-garmin/studio-booking/logs/cron.log 2>&1
 set -euo pipefail

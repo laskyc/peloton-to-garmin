@@ -1,12 +1,12 @@
-# Books a Peloton Studios in-person class when the weekly release opens
+# Books a Peloton Studios New York in-person class when the weekly release opens
 # (Thursdays 12:00 PM ET). Uses the same Peloton secrets as the sync workflow.
 #
-# WARNING: GitHub's scheduler is best-effort and often starts cron jobs
-# 5-30 minutes late at the top of the hour. The two cron lines fire at
-# 11:35 ET in both daylight and standard time; the script exits immediately
-# when the next release is more than STUDIO_MAX_WAIT_MINUTES away, so only
-# one of the two does real work. Prefer running studio-booking/run.sh from a
-# machine you control (see studio-booking/README.md) and keep this as backup.
+# WARNING: GitHub's scheduler is best-effort and often starts cron jobs 5-30 minutes
+# late at busy times. The two cron lines fire at 11:35 ET in both daylight and standard
+# time; the script exits at once when the next release is more than 60 minutes away, so
+# only one of them does real work. Also, Peloton's login page runs bot detection that may
+# challenge a datacenter browser. Prefer running studio-booking/run.sh from a machine you
+# control with a logged-in profile (see studio-booking/README.md) and keep this as backup.
 
 name: Book Peloton Studio class
 
@@ -14,21 +14,21 @@ on:
   workflow_dispatch:
     inputs:
       instructor:
-        description: Instructor name as shown on the class card
+        description: Instructor name as shown on the schedule
         default: Becs Gentry
-      discipline:
-        description: Optional text that must appear on the card (e.g. Tread)
-        default: Tread
+      class_name:
+        description: Optional text that must appear in the class name (e.g. Run)
+        default: ""
       class_time:
-        description: Optional time text that must appear on the card (e.g. 7:00 AM)
+        description: Optional start time (e.g. 7:30 AM)
         default: ""
       class_day:
-        description: Optional day text that must appear on the card (e.g. Sat)
+        description: Optional weekday (e.g. Sat)
         default: ""
       mode:
-        description: live = book for real, dry-run = stop before pay, discover = run now and record the site
+        description: live = book for real, dry-run = stop before the purchase call, now-dry-run = run immediately without waiting for Thursday
         type: choice
-        options: [live, dry-run, discover]
+        options: [live, dry-run, now-dry-run]
         default: dry-run
       waitlist:
         description: Join the waitlist if the class is full
@@ -73,9 +73,8 @@ jobs:
           P2G_PELOTON__EMAIL: ${{ secrets.P2G_PELOTON__EMAIL }}
           P2G_PELOTON__PASSWORD: ${{ secrets.P2G_PELOTON__PASSWORD }}
           NOTIFY_URL: ${{ secrets.STUDIO_NOTIFY_URL }}
-          STUDIO_SCHEDULE_URL: ${{ vars.STUDIO_SCHEDULE_URL }}
           STUDIO_INSTRUCTOR: ${{ github.event.inputs.instructor || 'Becs Gentry' }}
-          STUDIO_DISCIPLINE: ${{ github.event.inputs.discipline || 'Tread' }}
+          STUDIO_CLASS_NAME: ${{ github.event.inputs.class_name }}
           STUDIO_CLASS_TIME: ${{ github.event.inputs.class_time }}
           STUDIO_CLASS_DAY: ${{ github.event.inputs.class_day }}
           STUDIO_WAITLIST: ${{ github.event.inputs.waitlist || 'false' }}
@@ -86,10 +85,10 @@ jobs:
           if [ -z "$P2G_PELOTON__EMAIL" ] || [ -z "$P2G_PELOTON__PASSWORD" ]; then
             echo "::error::P2G_PELOTON__EMAIL / P2G_PELOTON__PASSWORD secrets are not set"; exit 1
           fi
-          ARGS=""
+          ARGS="--discover"
           case "$MODE" in
-            dry-run)  ARGS="--dry-run" ;;
-            discover) ARGS="--now --discover --dry-run" ;;
+            dry-run)     ARGS="$ARGS --dry-run" ;;
+            now-dry-run) ARGS="$ARGS --dry-run --now --poll-seconds 20" ;;
           esac
           python book_studio_class.py $ARGS
           rc=$?
@@ -100,7 +99,6 @@ jobs:
             3) echo "No release within the wait window at this run time; nothing to do";;
             *) echo "::error::Booker failed with exit $rc";;
           esac
-          # exit 2/3 are expected outcomes, not job failures
           [ $rc -eq 0 ] || [ $rc -eq 2 ] || [ $rc -eq 3 ]
 
       - name: Save login session
@@ -110,7 +108,7 @@ jobs:
           path: studio-booking/state
           key: studio-session-${{ github.run_id }}
 
-      - name: Upload screenshots and discovery output
+      - name: Upload screenshots and API log
         if: always() && steps.book.outputs.exit_code != '3'
         uses: actions/upload-artifact@v4
         with:
