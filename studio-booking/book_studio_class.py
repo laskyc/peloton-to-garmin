@@ -437,6 +437,25 @@ class Booker:
         except PlaywrightError as e:
             log(f"[{label}] describe failed: {e}")
 
+    def dismiss_cookie_banner(self, page: Page) -> None:
+        for sel in ("#fides-accept-all-button", "button:has-text('Accept all')", "button:has-text('Dismiss')",
+                    ".fides-close-button", "button[aria-label='Close']"):
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible():
+                    loc.click(timeout=1500)
+                    log("dismissed cookie banner")
+                    return
+            except PlaywrightError:
+                continue
+
+    def shell_logged_in(self, page: Page) -> bool:
+        """The Next.js header shows 'Account' when the Auth0 session exists, 'Log In' otherwise."""
+        try:
+            return page.get_by_role("button", name=re.compile(r"^account$", re.I)).first.is_visible()
+        except PlaywrightError:
+            return False
+
     def frame_logged_in(self, frame: Frame) -> bool:
         try:
             txt = frame.evaluate("() => document.body ? document.body.innerText : ''")
@@ -449,12 +468,8 @@ class Booker:
         cfg = self.cfg
         log(f"opening {SITE_URL}")
         page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60_000)
-        for s in ("#fides-accept-all-button", "button:has-text('Accept all')"):
-            try:
-                page.locator(s).first.click(timeout=1500)
-                break
-            except PlaywrightError:
-                pass
+        time.sleep(1.5)
+        self.dismiss_cookie_banner(page)
         frame = self.teamup_frame(page)
         if frame is None:
             raise SystemExit("TeamUp schedule frame did not load")
@@ -512,12 +527,24 @@ class Booker:
                 time.sleep(2.0)
                 self.describe_page(page, "after submitting credentials")
                 page.wait_for_url(re.compile(r"studio\.onepeloton\.com"), timeout=60_000)
-                log("back on studio.onepeloton.com, waiting for the schedule frame to pick up the session")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15_000)
+                except PlaywrightTimeout:
+                    pass
                 self.describe_page(page, "after redirect")
+                log(f"shell shows logged in: {self.shell_logged_in(page)}")
+                # the callback lands on the home page; go back to the schedule so the frame gets the token
+                log("returning to the schedule page")
+                page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60_000)
+                time.sleep(1.5)
+                self.dismiss_cookie_banner(page)
                 frame = self.teamup_frame(page)
-                for _ in range(60):
+                for i in range(60):
                     if frame and self.frame_logged_in(frame):
                         break
+                    if i == 20:  # the widget sometimes needs a reload to pick up the identity-provider token
+                        page.reload(wait_until="domcontentloaded")
+                        self.dismiss_cookie_banner(page)
                     time.sleep(0.5)
                     frame = self.teamup_frame(page, timeout=1)
             self.shot(page, "after_login")
@@ -525,7 +552,14 @@ class Booker:
         frame = self.teamup_frame(page)
         if frame is None or not self.frame_logged_in(frame):
             self.shot(page, "login_unconfirmed")
-            raise SystemExit("login did not stick (frame still shows LOG IN / REGISTER); see screenshots")
+            self.describe_page(page, "login unconfirmed")
+            if frame:
+                try:
+                    log("frame text: " + re.sub(r"\s+", " ", frame.evaluate("() => document.body.innerText"))[:300])
+                except PlaywrightError:
+                    pass
+            raise SystemExit(f"login did not stick (shell logged in: {self.shell_logged_in(page)}, "
+                             "frame still shows LOG IN / REGISTER); see screenshots")
 
         # The frame's API calls carry the customer session token; make it issue one.
         self.goto_frame(frame, self.release_dates_for_frame())
