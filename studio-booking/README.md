@@ -22,7 +22,7 @@ that starts 35 days later. Default target: any Becs Gentry class in that window.
   * Add `&e=<event id>` to open a class's booking modal directly.
   * Becs's live-class times (same classes you book in studio):
     `https://instructor-schedule.onepeloton.com/s/becs-gentry-schedule`
-* Payment: pay-as-you-go. You are charged **at booking** ($35 + tax). Cancelling at least 24 hours
+* Payment: pay-as-you-go. You are charged **at booking** ($35 + tax, $36.58 as of Oct 2026). Cancelling at least 24 hours
   before the class refunds it; later than that forfeits it. `--membership` books against a class
   credit/membership on the account instead.
 
@@ -96,6 +96,15 @@ Optional secret `STUDIO_NOTIFY_URL` (e.g. an ntfy.sh topic) gets a one-line resu
 | `NOTIFY_URL` | POST the one-line result here |
 
 Exit codes: 0 booked/waitlisted, 1 error, 2 polled but no spot, 3 no release within the wait window.
+
+## Verified so far (GitHub Actions dry runs, Oct 2026)
+
+* Auth0 login with the repo secrets works, and the saved session is reused on later runs.
+* The TeamUp token and customer id are captured; the eligibility check answers for the account
+  (drop-in only, no memberships, no outstanding waivers).
+* Becs's classes are found and polled about 3 times per second.
+* The purchase call itself has not run yet; the first live Thursday run is the real test. Watch the
+  job log and your email, and set `STUDIO_NOTIFY_URL` for a push notification.
 
 ## Limits to know about
 
