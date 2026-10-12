@@ -415,6 +415,27 @@ class Booker:
                     "method": req.method, "url": req.url, "post_data": (req.post_data or "")[:2000],
                 }) + "\n")
         page.on("request", on_request)
+        page.on("requestfailed", lambda r: log(f"request failed: {r.failure} {r.url[:120]}")
+                if "onepeloton.com" in r.url and r.resource_type in ("document", "xhr", "fetch", "script") else None)
+        page.on("console", lambda m: log(f"console {m.type}: {m.text[:200]}") if m.type == "error" and "datadog" not in m.text.lower() else None)
+
+    def describe_page(self, page: Page, label: str) -> None:
+        """Log what the page looks like (URL with secrets masked, fields, buttons, text) for remote debugging."""
+        try:
+            url = re.sub(r"(code|state|nonce|id_token|access_token|token)=[^&#]+", r"\1=<masked>", page.url)
+            info = page.evaluate("""() => ({
+                title: document.title,
+                inputs: [...document.querySelectorAll('input')].filter(i => i.type !== 'hidden')
+                    .map(i => `${i.type}|name=${i.name}|id=${i.id}|ph=${i.placeholder}|ac=${i.autocomplete}`),
+                buttons: [...document.querySelectorAll('button,[role=button],input[type=submit]')]
+                    .map(b => (b.innerText || b.value || b.getAttribute('aria-label') || '').trim().slice(0, 40)).filter(Boolean),
+                text: (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').slice(0, 400),
+            })""")
+            log(f"[{label}] url={url}")
+            log(f"[{label}] title={info['title']!r} inputs={info['inputs']} buttons={info['buttons'][:15]}")
+            log(f"[{label}] text={info['text']!r}")
+        except PlaywrightError as e:
+            log(f"[{label}] describe failed: {e}")
 
     def frame_logged_in(self, frame: Frame) -> bool:
         try:
@@ -460,6 +481,11 @@ class Booker:
                 log("logging in through Peloton (Auth0)")
                 page.get_by_role("button", name=re.compile(r"log ?in", re.I)).first.click(timeout=10_000)
                 page.wait_for_url(re.compile(r"auth\.onepeloton\.com"), timeout=30_000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15_000)
+                except PlaywrightTimeout:
+                    pass
+                self.describe_page(page, "auth0 login page")
                 email = self.visible(page, ["input[type='email']", "input[name='username']", "input[name='email']",
                                             "input[autocomplete='username']", "input[id*='email' i]"], 30_000)
                 if email is None:
@@ -483,8 +509,11 @@ class Booker:
                     submit.click()
                 else:
                     pw.press("Enter")
+                time.sleep(2.0)
+                self.describe_page(page, "after submitting credentials")
                 page.wait_for_url(re.compile(r"studio\.onepeloton\.com"), timeout=60_000)
                 log("back on studio.onepeloton.com, waiting for the schedule frame to pick up the session")
+                self.describe_page(page, "after redirect")
                 frame = self.teamup_frame(page)
                 for _ in range(60):
                     if frame and self.frame_logged_in(frame):
