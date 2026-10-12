@@ -817,6 +817,23 @@ class Booker:
             attempt += 1
             try:
                 events = api.events(cfg.instructor_id, start, end)
+            except requests.HTTPError as e:
+                resp = e.response
+                if resp is not None and resp.status_code == 429:
+                    try:
+                        wait = float(resp.headers.get("Retry-After", "0"))
+                    except ValueError:
+                        wait = 0.0
+                    wait = min(max(wait, 1.0), 10.0)
+                    log(f"rate limited (429); backing off {wait:.1f}s")
+                    time.sleep(wait)
+                else:
+                    msg = f"events request failed: {e}"
+                    if msg != last_msg:
+                        log(msg)
+                        last_msg = msg
+                    time.sleep(cfg.poll_interval)
+                continue
             except requests.RequestException as e:
                 msg = f"events request failed: {e}"
                 if msg != last_msg:
