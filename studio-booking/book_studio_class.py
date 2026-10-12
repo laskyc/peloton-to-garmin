@@ -315,6 +315,14 @@ class TeamUp:
             payload["customer_membership"] = customer_membership
         return self.post(f"events/{event_id}/register", payload)
 
+    def registration_status(self, event_id: int) -> Optional[str]:
+        """'registered' / 'on_waitlist' / None for the logged-in customer (needs the session token)."""
+        try:
+            ev = self.get(f"events/{event_id}", {"expand": "active_registration_status"}, timeout=6)
+        except requests.RequestException:
+            return None
+        return (ev.get("active_registration_status") or {}).get("current_status")
+
     def join_waitlist(self, customer: int, event_id: int) -> tuple[int, Any]:
         return self.post(f"events/{event_id}/join_waitlist", {"customer": customer})
 
@@ -638,7 +646,9 @@ class Booker:
                 return "waitlisted"
             st, body = api.join_waitlist(self.customer, eid)
             log(f"join_waitlist -> {st} {json.dumps(body)[:200]}")
-            return "waitlisted" if st < 300 else "rejected"
+            if st < 300 or api.registration_status(eid) == "on_waitlist":
+                return "waitlisted"
+            return "rejected"
 
         if cfg.dry_run:
             log(f"DRY RUN: would book {describe(ev)}")
@@ -661,8 +671,10 @@ class Booker:
             return "rejected"
         next_url = body.get("next_url") if isinstance(body, dict) else None
         if next_url:
-            return "booked" if self.finish_checkout(page, next_url) else "rejected"
-        return "booked"
+            return "booked" if self.finish_checkout(page, api, eid, next_url) else "rejected"
+        status = api.registration_status(eid)
+        log(f"registration status after purchase call: {status}")
+        return "booked" if status == "registered" else "rejected"
 
     def _membership_id(self, api: TeamUp, eid: int) -> Optional[int]:
         st, body = api.eligibility(self.customer, eid)
@@ -674,46 +686,86 @@ class Booker:
                 return int(cm["id"] if isinstance(cm, dict) else cm)
         return None
 
-    def finish_checkout(self, page: Page, next_url: str) -> bool:
-        """Open TeamUp's checkout page and confirm payment with the card on file."""
+    def finish_checkout(self, page: Page, api: TeamUp, eid: int, next_url: str) -> bool:
+        """Open TeamUp's checkout page (inside the schedule frame, where the session lives), click
+        through pay/confirm steps, and treat the event's registration status as the truth."""
         if next_url.startswith("/"):
             next_url = TEAMUP_HOST + next_url
         log(f"opening checkout {next_url}")
+        frame = self.teamup_frame(page, timeout=2)
+        target = frame if frame is not None else page
         try:
-            page.goto(next_url, wait_until="domcontentloaded", timeout=30_000)
+            if frame is not None:
+                frame.evaluate("u => { location.href = u }", next_url)
+                frame.wait_for_load_state("domcontentloaded", timeout=30_000)
+            else:
+                page.goto(next_url, wait_until="domcontentloaded", timeout=30_000)
         except PlaywrightError as e:
             log(f"checkout navigation failed: {e}")
-            return False
+        time.sleep(1.0)
         self.shot(page, "checkout")
-        deadline = time.time() + 90
-        confirm_sel = ["button:has-text('Confirm and pay')", "button:has-text('Pay now')", "button:has-text('Pay')",
-                       "button:has-text('Complete purchase')", "button:has-text('Complete')", "button:has-text('Confirm')",
-                       "button:has-text('Book')", "button:has-text('Agree')", "button:has-text('Accept')", "button[type='submit']"]
-        success_re = re.compile(r"booked successfully|you.?re booked|booking confirmed|thank you|confirmed|see you", re.I)
+
+        action_re = re.compile(r"\b(pay|confirm|complete|purchase|place order|book|checkout|continue|agree|accept)\b", re.I)
+        skip_re = re.compile(r"cancel|back|remove|edit|change|add (a )?(new )?card|log ?out|close|dismiss|manage", re.I)
+        deadline = time.time() + 120
+        last_url = None
+        clicks = 0
         while time.time() < deadline:
-            try:
-                txt = page.evaluate("() => document.body.innerText")
-            except PlaywrightError:
-                txt = ""
-            if success_re.search(txt):
+            status = api.registration_status(eid)
+            if status == "registered":
+                log("TeamUp reports the customer as registered for the class")
                 self.shot(page, "checkout_success")
                 return True
-            if re.search(r"class is full|sold out|no longer available", txt, re.I):
+            # re-resolve the frame: the checkout page may navigate it
+            frame = self.teamup_frame(page, timeout=0.5)
+            target = frame if frame is not None else page
+            try:
+                url = target.url
+                if url != last_url:
+                    last_url = url
+                    masked = re.sub(r"(token|auth0IdToken)=[^&#]+", r"\1=<masked>", url)
+                    log(f"checkout page: {masked}")
+                    log("checkout text: " + re.sub(r"\s+", " ", target.evaluate("() => document.body ? document.body.innerText : ''"))[:400])
+                txt = target.evaluate("() => document.body ? document.body.innerText : ''")
+            except PlaywrightError:
+                txt = ""
+            if re.search(r"class is full|sold out|no longer available|event is full", txt, re.I):
                 log("checkout says the class is no longer available")
                 return False
-            btn = self.visible(page, confirm_sel, 700)
-            if btn is not None:
-                try:
-                    label = btn.inner_text(timeout=500).strip()
-                    btn.click(timeout=3000)
-                    log(f"clicked '{label}' on checkout")
-                    self.shot(page, "checkout_click")
-                    time.sleep(1.0)
-                except PlaywrightError:
-                    pass
-            time.sleep(0.3)
-        log("checkout did not confirm within 90s; check screenshots and your email")
-        return False
+            # click the most purchase-like visible button
+            try:
+                buttons = target.locator("button, input[type='submit'], a.btn, a[role='button']")
+                n = min(buttons.count(), 40)
+                best = None
+                for i in range(n):
+                    b = buttons.nth(i)
+                    try:
+                        if not b.is_visible() or not b.is_enabled():
+                            continue
+                        label = (b.inner_text(timeout=300) or b.get_attribute("value") or b.get_attribute("aria-label") or "").strip()
+                    except PlaywrightError:
+                        continue
+                    if not label or skip_re.search(label) or not action_re.search(label):
+                        continue
+                    score = 3 if re.search(r"\bpay\b", label, re.I) else 2 if re.search(r"confirm|complete|purchase|place order", label, re.I) else 1
+                    if best is None or score > best[0]:
+                        best = (score, label, b)
+                if best is not None:
+                    clicks += 1
+                    log(f"clicking '{best[1]}' on checkout (click {clicks})")
+                    best[2].click(timeout=4000)
+                    self.shot(page, f"checkout_click{clicks}")
+                    time.sleep(2.0)
+                    if clicks >= 6:
+                        log("clicked six times without TeamUp confirming the registration; stopping clicks")
+                        time.sleep(10)
+                        return api.registration_status(eid) == "registered"
+                    continue
+            except PlaywrightError as e:
+                log(f"checkout interaction error: {e}")
+            time.sleep(1.0)
+        log("checkout did not confirm within 120s; check screenshots and your email")
+        return api.registration_status(eid) == "registered"
 
     def click_fallback(self, page: Page, ev: dict) -> str:
         """Open the booking modal inside the TeamUp frame and click Book / Join waitlist."""
@@ -738,15 +790,17 @@ class Booker:
         self.shot(page, "modal_clicked")
         # drop-in flow leaves the frame for a checkout page; follow it on the main page
         time.sleep(2.0)
+        api = self.api()
         for f in page.frames:
             if "checkout" in f.url or "/purchase" in f.url:
-                return "booked" if self.finish_checkout(page, f.url) else "rejected"
-        try:
-            txt = frame.evaluate("() => document.body.innerText")
-        except PlaywrightError:
-            txt = ""
-        if re.search(r"booked successfully|joined waitlist|you.?re on the waitlist", txt, re.I):
-            return kind
+                return "booked" if self.finish_checkout(page, api, int(ev["id"]), f.url) else "rejected"
+        for _ in range(20):
+            status = api.registration_status(int(ev["id"]))
+            if status == "registered":
+                return "booked"
+            if status == "on_waitlist":
+                return "waitlisted"
+            time.sleep(1.0)
         return "rejected"
 
     # -- polling -----------------------------------------------------------------
