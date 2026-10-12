@@ -189,7 +189,7 @@ def log(msg: str) -> None:
     print(f"[{dt.datetime.now(ET).strftime('%H:%M:%S.%f')[:-3]} ET] {msg}", flush=True)
 
 
-def next_release(cfg: Config, now: Optional[dt.datetime] = None, grace: dt.timedelta = dt.timedelta(minutes=10)) -> dt.datetime:
+def next_release(cfg: Config, now: Optional[dt.datetime] = None, grace: dt.timedelta = dt.timedelta(minutes=30)) -> dt.datetime:
     """Next release instant in ET. A release < `grace` ago still counts so a late cron joins the window."""
     now = now or dt.datetime.now(ET)
     days_ahead = (cfg.release_weekday - now.date().weekday()) % 7
