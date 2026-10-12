@@ -88,7 +88,9 @@ jobs:
           ARGS="--discover"
           case "$MODE" in
             dry-run)     ARGS="$ARGS --dry-run" ;;
-            now-dry-run) ARGS="$ARGS --dry-run --now --poll-seconds 20" ;;
+            now-dry-run)
+              # look at the already-published week so the run actually finds classes
+              ARGS="$ARGS --dry-run --now --poll-seconds 20 --window-start $(date +%F) --window-end $(date -d '+7 days' +%F)" ;;
           esac
           python book_studio_class.py $ARGS
           rc=$?
