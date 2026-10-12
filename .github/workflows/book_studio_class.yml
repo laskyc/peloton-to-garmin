@@ -1,0 +1,120 @@
+# Books a Peloton Studios in-person class when the weekly release opens
+# (Thursdays 12:00 PM ET). Uses the same Peloton secrets as the sync workflow.
+#
+# WARNING: GitHub's scheduler is best-effort and often starts cron jobs
+# 5-30 minutes late at the top of the hour. The two cron lines fire at
+# 11:35 ET in both daylight and standard time; the script exits immediately
+# when the next release is more than STUDIO_MAX_WAIT_MINUTES away, so only
+# one of the two does real work. Prefer running studio-booking/run.sh from a
+# machine you control (see studio-booking/README.md) and keep this as backup.
+
+name: Book Peloton Studio class
+
+on:
+  workflow_dispatch:
+    inputs:
+      instructor:
+        description: Instructor name as shown on the class card
+        default: Becs Gentry
+      discipline:
+        description: Optional text that must appear on the card (e.g. Tread)
+        default: Tread
+      class_time:
+        description: Optional time text that must appear on the card (e.g. 7:00 AM)
+        default: ""
+      class_day:
+        description: Optional day text that must appear on the card (e.g. Sat)
+        default: ""
+      mode:
+        description: live = book for real, dry-run = stop before pay, discover = run now and record the site
+        type: choice
+        options: [live, dry-run, discover]
+        default: dry-run
+      waitlist:
+        description: Join the waitlist if the class is full
+        type: boolean
+        default: false
+  schedule:
+    - cron: '35 15 * * 4'   # 11:35 ET while US daylight time is in effect
+    - cron: '35 16 * * 4'   # 11:35 ET while US standard time is in effect
+
+concurrency:
+  group: book-studio-class
+  cancel-in-progress: false
+
+jobs:
+  book:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Playwright
+        working-directory: studio-booking
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Restore saved login session
+        uses: actions/cache/restore@v4
+        with:
+          path: studio-booking/state
+          key: studio-session-${{ github.run_id }}
+          restore-keys: studio-session-
+
+      - name: Book class
+        id: book
+        working-directory: studio-booking
+        env:
+          P2G_PELOTON__EMAIL: ${{ secrets.P2G_PELOTON__EMAIL }}
+          P2G_PELOTON__PASSWORD: ${{ secrets.P2G_PELOTON__PASSWORD }}
+          NOTIFY_URL: ${{ secrets.STUDIO_NOTIFY_URL }}
+          STUDIO_SCHEDULE_URL: ${{ vars.STUDIO_SCHEDULE_URL }}
+          STUDIO_INSTRUCTOR: ${{ github.event.inputs.instructor || 'Becs Gentry' }}
+          STUDIO_DISCIPLINE: ${{ github.event.inputs.discipline || 'Tread' }}
+          STUDIO_CLASS_TIME: ${{ github.event.inputs.class_time }}
+          STUDIO_CLASS_DAY: ${{ github.event.inputs.class_day }}
+          STUDIO_WAITLIST: ${{ github.event.inputs.waitlist || 'false' }}
+          MODE: ${{ github.event.inputs.mode || 'live' }}
+          TZ: America/New_York
+        run: |
+          set +e
+          if [ -z "$P2G_PELOTON__EMAIL" ] || [ -z "$P2G_PELOTON__PASSWORD" ]; then
+            echo "::error::P2G_PELOTON__EMAIL / P2G_PELOTON__PASSWORD secrets are not set"; exit 1
+          fi
+          ARGS=""
+          case "$MODE" in
+            dry-run)  ARGS="--dry-run" ;;
+            discover) ARGS="--now --discover --dry-run" ;;
+          esac
+          python book_studio_class.py $ARGS
+          rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          case $rc in
+            0) echo "::notice::Booked (or waitlisted)";;
+            2) echo "::warning::Release polled but no spot obtained";;
+            3) echo "No release within the wait window at this run time; nothing to do";;
+            *) echo "::error::Booker failed with exit $rc";;
+          esac
+          # exit 2/3 are expected outcomes, not job failures
+          [ $rc -eq 0 ] || [ $rc -eq 2 ] || [ $rc -eq 3 ]
+
+      - name: Save login session
+        if: always() && steps.book.outputs.exit_code != '3'
+        uses: actions/cache/save@v4
+        with:
+          path: studio-booking/state
+          key: studio-session-${{ github.run_id }}
+
+      - name: Upload screenshots and discovery output
+        if: always() && steps.book.outputs.exit_code != '3'
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-booking-${{ github.run_id }}
+          path: studio-booking/out
+          if-no-files-found: ignore
+          retention-days: 14

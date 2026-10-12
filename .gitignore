@@ -123,3 +123,11 @@ configuration.local.json
 /.vs/ProjectSettings.json
 .vs/
 /.vscode/settings.json
+
+# studio-booking runtime files
+studio-booking/state/
+studio-booking/out/
+studio-booking/out-smoke/
+studio-booking/logs/
+studio-booking/.env
+studio-booking/selectors.json
