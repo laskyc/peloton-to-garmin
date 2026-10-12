@@ -143,7 +143,7 @@ def parse_args(argv: Optional[list[str]] = None) -> Config:
                    help="Exit immediately if the next release is further away (lets a cron fire at both DST offsets)")
     p.add_argument("--poll-seconds", type=float, default=float(env("STUDIO_POLL_SECONDS", "300")),
                    help="How long to keep polling after the release time")
-    p.add_argument("--poll-interval", type=float, default=float(env("STUDIO_POLL_INTERVAL", "0.4")))
+    p.add_argument("--poll-interval", type=float, default=float(env("STUDIO_POLL_INTERVAL", "0.3")))
     p.add_argument("--waitlist", action="store_true", default=env("STUDIO_WAITLIST", "false").lower() == "true")
     p.add_argument("--membership", action="store_true", default=env("STUDIO_MEMBERSHIP", "false").lower() == "true",
                    help="Book with a class credit/membership on the account instead of a $35 drop-in purchase")
@@ -347,9 +347,20 @@ def event_matches(cfg: Config, ev: dict) -> bool:
     return True
 
 
+def is_event_full(ev: dict) -> bool:
+    """TeamUp's is_full flag lags; the registration status is authoritative."""
+    ars = ev.get("active_registration_status") or {}
+    if "event_full" in (ars.get("restriction_codes") or []) or ars.get("suggested_action") == "join_waitlist":
+        return True
+    if ev.get("is_full"):
+        return True
+    occ, mx = ev.get("occupancy"), ev.get("max_occupancy")
+    return bool(mx) and occ is not None and occ >= mx
+
+
 def describe(ev: dict) -> str:
     starts = dt.datetime.fromisoformat(ev["starts_at"]).astimezone(ET)
-    full = ev.get("is_full")
+    full = is_event_full(ev)
     return (f"{ev['id']} {starts:%a %m/%d %-I:%M %p} {ev.get('name','?')} "
             f"[{'FULL' if full else 'open'} {ev.get('occupancy', '?')}/{ev.get('max_occupancy', '?')}, waitlist {ev.get('waiting_count', 0)}]")
 
@@ -615,7 +626,11 @@ class Booker:
         """Returns booked | waitlisted | full | rejected."""
         cfg = self.cfg
         eid = int(ev["id"])
-        if ev.get("is_full"):
+        if cfg.dry_run:
+            # read-only call that proves the session can act for this customer and shows the options
+            st, body = api.eligibility(self.customer, eid)
+            log(f"eligibility check for {eid} -> {st} {json.dumps(body)[:500]}")
+        if is_event_full(ev):
             if not cfg.waitlist:
                 return "full"
             if cfg.dry_run:
@@ -627,8 +642,6 @@ class Booker:
 
         if cfg.dry_run:
             log(f"DRY RUN: would book {describe(ev)}")
-            st, body = api.eligibility(self.customer, eid)
-            log(f"eligibility check -> {st} {json.dumps(body)[:400]}")
             return "booked"
 
         if cfg.membership:
@@ -766,10 +779,10 @@ class Booker:
                 time.sleep(cfg.poll_interval)
                 continue
             # prefer open classes, earliest first
-            candidates.sort(key=lambda e: (bool(e.get("is_full")), e["starts_at"]))
+            candidates.sort(key=lambda e: (is_event_full(e), e["starts_at"]))
             for ev in candidates:
-                state = (int(ev["id"]), bool(ev.get("is_full")), ev.get("occupancy"), ev.get("waiting_count"))
-                if state in seen_states and ev.get("is_full") and not cfg.waitlist:
+                state = (int(ev["id"]), is_event_full(ev), ev.get("occupancy"), ev.get("waiting_count"))
+                if state in seen_states and is_event_full(ev) and not cfg.waitlist:
                     continue  # still full, nothing new to do; stay quiet until the counts change
                 seen_states.add(state)
                 log(f"attempt {attempt}: trying {describe(ev)}")

@@ -87,7 +87,7 @@ Optional secret `STUDIO_NOTIFY_URL` (e.g. an ntfy.sh topic) gets a one-line resu
 | `--waitlist` | Join the waitlist when the class is full |
 | `--membership` | Book with a credit/membership instead of a $35 drop-in purchase |
 | `--prestart-minutes` | Login lead time (default 5) |
-| `--poll-seconds` / `--poll-interval` | Polling window after noon (default 300 s at 0.4 s) |
+| `--poll-seconds` / `--poll-interval` | Polling window after noon (default 300 s at 0.3 s) |
 | `--dry-run` | Stop before the purchase/waitlist call (still runs the eligibility check) |
 | `--now` | Don't wait for Thursday; poll immediately |
 | `--login-only --headful` | Open a browser, log in (by hand if no creds), save session, exit |
